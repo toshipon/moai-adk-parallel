@@ -68,55 +68,94 @@ get_log_status() {
 
     # ログの最後の部分を取得（最新状態を確認）
     local last_part=$(tail -100 "${latest_log}" 2>/dev/null)
+    # 直近の部分（エラー回復判定用）
+    local very_last_part=$(tail -20 "${latest_log}" 2>/dev/null)
 
-    # 1. Rate limit 検出（最優先）
+    # 1. tmux ペインの状態を最初に確認（実行中かどうか）
+    local window_name="${spec_name}"
+    local pane_content=$(tmux capture-pane -t "${TMUX_SESSION}:${window_name}" -p 2>/dev/null | tail -10)
+    local claude_running=false
+
+    # Claude が実行中かどうかを判定（より厳密に）
+    # pane_content に claude/Claude があり、シェルプロンプトで終わっていない場合は実行中
+    if echo "${pane_content}" | grep -qi "claude\|✻\|⎿\|Brewed\|thinking"; then
+        # 最後の行がシェルプロンプトでなければ実行中
+        local last_line=$(echo "${pane_content}" | tail -1)
+        if ! echo "${last_line}" | grep -qE "^[~\$%➜❯]"; then
+            claude_running=true
+        fi
+    fi
+
+    # 2. Rate limit 検出（最優先 - 実行中でも検出）
     if echo "${last_part}" | grep -q "hit your limit\|rate.limit\|resets.*pm"; then
         echo "rate_limited"
         return
     fi
 
-    # 1.5. Context limit 検出（入力待ち状態）
-    if echo "${last_part}" | grep -q "Context limit reached\|/compact or /clear"; then
-        echo "context_limited"
+    # 3. Claude が実行中なら、過去のエラーは無視して running を返す
+    if [[ "${claude_running}" == true ]]; then
+        echo "running"
         return
     fi
 
-    # 1.6. ユーザー入力待ち検出（tmux ペインの状態を確認）
-    local pane_check=$(tmux capture-pane -t "${TMUX_SESSION}:${spec_name}" -p 2>/dev/null | tail -10)
-    if echo "${pane_check}" | grep -q "Enter to select\|Enter to confirm\|AskUserQuestion\|進めてよろしいでしょうか"; then
-        echo "waiting_input"
-        return
-    fi
-
-    # 2. エラー検出（致命的なエラーのみ）
-    # hook エラーや一時的なビルドエラーは除外し、致命的なエラーのみ検出
-    if echo "${last_part}" | grep -qE "fatal:|panic:|FATAL|PANIC|Traceback|Exception:" | grep -qv "hook"; then
-        echo "error"
-        return
-    fi
-
-    # 3. PR 作成成功を検出（汎用的な完了判定）
-    # github.com/...pull/XX 形式のURL、または "Created pull request" 等
+    # 4. PR 作成成功を検出（汎用的な完了判定）
     if grep -qE "github\.com/.*/pull/[0-9]+|Created pull request|PR #[0-9]+ created|✅.*PR.*完了" "${latest_log}" 2>/dev/null; then
         echo "success"
         return
     fi
 
-    # 4. tmux ペインの状態を確認（シェルプロンプトに戻っているか）
-    # SPEC名からウィンドウ番号を特定してペインの状態を確認
-    local window_name="${spec_name}"
-    local pane_content=$(tmux capture-pane -t "${TMUX_SESSION}:${window_name}" -p 2>/dev/null | tail -5)
+    # 5. シェルプロンプトに戻っているか確認
+    local at_prompt=false
+    if echo "${pane_content}" | grep -qE "^[~\$%➜❯]|^\s*$" && ! echo "${pane_content}" | grep -qi "claude"; then
+        at_prompt=true
+    fi
 
-    # シェルプロンプト（➜ や $ や %）で終わっていて、claudeが動いていなければ完了
-    if echo "${pane_content}" | grep -qE "^[~\$%➜❯]|^\s*$" && ! echo "${pane_content}" | grep -q "claude\|Claude"; then
-        # ログにPR関連の情報があれば完了
+    if [[ "${at_prompt}" == true ]]; then
+        # プロンプトに戻っている場合、PRがあれば成功
         if grep -qE "pull/[0-9]+|pr/[0-9]+|PR.*#[0-9]+" "${latest_log}" 2>/dev/null; then
             echo "success"
             return
         fi
+
+        # 6. 致命的エラー検出（プロンプトに戻っている場合のみ）
+        # ログの最後の部分でエラーを確認
+        # API Error: 500, 502, 503 など
+        if echo "${last_part}" | grep -qE "API Error: [45][0-9]{2}"; then
+            echo "error"
+            return
+        fi
+        # JSON形式のエラーレスポンス
+        if echo "${last_part}" | grep -qE '"type"\s*:\s*"(error|api_error)"'; then
+            echo "error"
+            return
+        fi
+        # Internal server error
+        if echo "${last_part}" | grep -qi "Internal server error"; then
+            echo "error"
+            return
+        fi
+        # 接続エラー
+        if echo "${last_part}" | grep -qiE "connection refused|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|socket hang up"; then
+            echo "error"
+            return
+        fi
+        # 認証エラー
+        if echo "${last_part}" | grep -qE "Authentication failed|Unauthorized|401|403"; then
+            echo "error"
+            return
+        fi
+        # Claude固有のエラー（Overloaded など）
+        if echo "${last_part}" | grep -qiE "overloaded|service unavailable|bad gateway"; then
+            echo "error"
+            return
+        fi
+
+        # PRもエラーもない場合は停止
+        echo "stopped"
+        return
     fi
 
-    # 5. 完了マーカーがない場合は、まだ実行中とみなす
+    # 7. 完了マーカーがない場合は、まだ実行中とみなす
     if [[ -s "${latest_log}" ]]; then
         echo "running"
     else
@@ -158,15 +197,23 @@ show_status() {
     local error=0
     local pending=0
     local rate_limited=0
-    local context_limited=0
-    local waiting_input=0
+    local stopped=0
 
+    # SPEC 名をユニークに抽出（重複を除去）
+    local unique_specs=()
     for log_file in "${LOG_DIR}"/SPEC-*.log; do
         if [[ ! -f "${log_file}" ]]; then
             continue
         fi
+        local name=$(basename "${log_file}" | sed 's/-[0-9].*\.log$//')
+        # 配列に含まれていなければ追加
+        if [[ ! " ${unique_specs[*]} " =~ " ${name} " ]]; then
+            unique_specs+=("${name}")
+        fi
+    done
 
-        local spec_name=$(basename "${log_file}" | sed 's/-[0-9].*\.log$//')
+    # ユニークな SPEC 名ごとに処理
+    for spec_name in "${unique_specs[@]}"; do
         local spec_status=$(get_spec_status "${spec_name}")
         local log_status=$(get_log_status "${spec_name}")
 
@@ -184,20 +231,15 @@ show_status() {
                 status_color="${YELLOW}"
                 ((rate_limited++))
                 ;;
-            context_limited)
-                status_icon="📦"
-                status_color="${YELLOW}"
-                ((context_limited++))
-                ;;
-            waiting_input)
-                status_icon="⏳"
-                status_color="${YELLOW}"
-                ((waiting_input++))
-                ;;
             error)
                 status_icon="❌"
                 status_color="${RED}"
                 ((error++))
+                ;;
+            stopped)
+                status_icon="⛔"
+                status_color="${RED}"
+                ((stopped++))
                 ;;
             running)
                 status_icon="🔄"
@@ -219,7 +261,7 @@ show_status() {
     echo ""
 
     # サマリー
-    echo -e "${CYAN}サマリー: ✅ ${completed} 完了 | 🔄 ${running} 実行中 | ⌨️ ${waiting_input} 入力待ち | ⏸️ ${rate_limited} API制限 | 📦 ${context_limited} CTX制限 | ❌ ${error} エラー${NC}"
+    echo -e "${CYAN}サマリー: ✅ ${completed} 完了 | 🔄 ${running} 実行中 | ⏸️ ${rate_limited} 制限 | ❌ ${error} エラー | ⛔ ${stopped} 停止 | ⏳ ${pending} 待機${NC}"
     echo ""
 }
 
