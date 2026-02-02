@@ -191,8 +191,8 @@ git worktree prune
 
 ## 📚 関連リンク
 
-- [Zenn 記事: Claude Code で複数タスクを並列実行する MoAI Parallel SPEC Executor](https://zenn.dev/)
-- [MoAI-ADK リポジトリ](https://github.com/toshipon/kaizen-lab)
+- [MoAI-ADK 本体](https://github.com/modu-ai/moai-adk) - SPEC 駆動 TDD 開発フレームワーク
+- [MoAI-ADK で始める SPEC 駆動 TDD 開発](https://zenn.dev/toshipon/articles/bdcd3438cf6dc3) - MoAI-ADK の基本概念と使い方
 
 ## 📄 ライセンス
 
