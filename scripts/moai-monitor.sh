@@ -66,20 +66,37 @@ get_log_status() {
         return
     fi
 
-    # 1. 完了判定: May the Force be with you が含まれていれば完了
-    if grep -q "May the Force be with you" "${latest_log}" 2>/dev/null; then
+    # ログの最後の部分を取得（最新状態を確認）
+    local last_part=$(tail -100 "${latest_log}" 2>/dev/null)
+
+    # 1. Rate limit 検出（最優先）
+    if echo "${last_part}" | grep -q "hit your limit\|rate.limit\|resets.*pm"; then
+        echo "rate_limited"
+        return
+    fi
+
+    # 2. PR 作成成功を検出（汎用的な完了判定）
+    # github.com/...pull/XX 形式のURL、または "Created pull request" 等
+    if grep -qE "github\.com/.*/pull/[0-9]+|Created pull request|PR #[0-9]+ created|✅.*PR.*完了" "${latest_log}" 2>/dev/null; then
         echo "success"
         return
     fi
 
-    # 2. PR作成完了のマーカーを検索
-    if grep -q "PR 作成完了\|PR作成完了\|pull request.*created" "${latest_log}" 2>/dev/null; then
-        echo "success"
-        return
+    # 3. tmux ペインの状態を確認（シェルプロンプトに戻っているか）
+    # SPEC名からウィンドウ番号を特定してペインの状態を確認
+    local window_name="${spec_name}"
+    local pane_content=$(tmux capture-pane -t "${TMUX_SESSION}:${window_name}" -p 2>/dev/null | tail -5)
+
+    # シェルプロンプト（➜ や $ や %）で終わっていて、claudeが動いていなければ完了
+    if echo "${pane_content}" | grep -qE "^[~\$%➜❯]|^\s*$" && ! echo "${pane_content}" | grep -q "claude\|Claude"; then
+        # ログにPR関連の情報があれば完了
+        if grep -qE "pull/[0-9]+|pr/[0-9]+|PR.*#[0-9]+" "${latest_log}" 2>/dev/null; then
+            echo "success"
+            return
+        fi
     fi
 
-    # 3. 完了マーカーがない場合は、まだ実行中とみなす
-    # （ビルドエラーやMCPエラーは一時的な問題の可能性があり、セッションは継続中）
+    # 4. 完了マーカーがない場合は、まだ実行中とみなす
     if [[ -s "${latest_log}" ]]; then
         echo "running"
     else
@@ -120,6 +137,7 @@ show_status() {
     local running=0
     local error=0
     local pending=0
+    local rate_limited=0
 
     for log_file in "${LOG_DIR}"/SPEC-*.log; do
         if [[ ! -f "${log_file}" ]]; then
@@ -138,6 +156,11 @@ show_status() {
                 status_icon="✅"
                 status_color="${GREEN}"
                 ((completed++))
+                ;;
+            rate_limited)
+                status_icon="⏸️"
+                status_color="${YELLOW}"
+                ((rate_limited++))
                 ;;
             error)
                 status_icon="❌"
@@ -164,7 +187,7 @@ show_status() {
     echo ""
 
     # サマリー
-    echo -e "${CYAN}サマリー: ✅ ${completed} 完了 | 🔄 ${running} 実行中 | ❌ ${error} エラー | ⏳ ${pending} 待機${NC}"
+    echo -e "${CYAN}サマリー: ✅ ${completed} 完了 | 🔄 ${running} 実行中 | ⏸️ ${rate_limited} 制限 | ❌ ${error} エラー | ⏳ ${pending} 待機${NC}"
     echo ""
 }
 
