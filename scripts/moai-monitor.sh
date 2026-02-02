@@ -75,14 +75,34 @@ get_log_status() {
         return
     fi
 
-    # 2. PR 作成成功を検出（汎用的な完了判定）
+    # 1.5. Context limit 検出（入力待ち状態）
+    if echo "${last_part}" | grep -q "Context limit reached\|/compact or /clear"; then
+        echo "context_limited"
+        return
+    fi
+
+    # 1.6. ユーザー入力待ち検出（tmux ペインの状態を確認）
+    local pane_check=$(tmux capture-pane -t "${TMUX_SESSION}:${spec_name}" -p 2>/dev/null | tail -10)
+    if echo "${pane_check}" | grep -q "Enter to select\|Enter to confirm\|AskUserQuestion\|進めてよろしいでしょうか"; then
+        echo "waiting_input"
+        return
+    fi
+
+    # 2. エラー検出（致命的なエラーのみ）
+    # hook エラーや一時的なビルドエラーは除外し、致命的なエラーのみ検出
+    if echo "${last_part}" | grep -qE "fatal:|panic:|FATAL|PANIC|Traceback|Exception:" | grep -qv "hook"; then
+        echo "error"
+        return
+    fi
+
+    # 3. PR 作成成功を検出（汎用的な完了判定）
     # github.com/...pull/XX 形式のURL、または "Created pull request" 等
     if grep -qE "github\.com/.*/pull/[0-9]+|Created pull request|PR #[0-9]+ created|✅.*PR.*完了" "${latest_log}" 2>/dev/null; then
         echo "success"
         return
     fi
 
-    # 3. tmux ペインの状態を確認（シェルプロンプトに戻っているか）
+    # 4. tmux ペインの状態を確認（シェルプロンプトに戻っているか）
     # SPEC名からウィンドウ番号を特定してペインの状態を確認
     local window_name="${spec_name}"
     local pane_content=$(tmux capture-pane -t "${TMUX_SESSION}:${window_name}" -p 2>/dev/null | tail -5)
@@ -96,7 +116,7 @@ get_log_status() {
         fi
     fi
 
-    # 4. 完了マーカーがない場合は、まだ実行中とみなす
+    # 5. 完了マーカーがない場合は、まだ実行中とみなす
     if [[ -s "${latest_log}" ]]; then
         echo "running"
     else
@@ -138,6 +158,8 @@ show_status() {
     local error=0
     local pending=0
     local rate_limited=0
+    local context_limited=0
+    local waiting_input=0
 
     for log_file in "${LOG_DIR}"/SPEC-*.log; do
         if [[ ! -f "${log_file}" ]]; then
@@ -161,6 +183,16 @@ show_status() {
                 status_icon="⏸️"
                 status_color="${YELLOW}"
                 ((rate_limited++))
+                ;;
+            context_limited)
+                status_icon="📦"
+                status_color="${YELLOW}"
+                ((context_limited++))
+                ;;
+            waiting_input)
+                status_icon="⏳"
+                status_color="${YELLOW}"
+                ((waiting_input++))
                 ;;
             error)
                 status_icon="❌"
@@ -187,7 +219,7 @@ show_status() {
     echo ""
 
     # サマリー
-    echo -e "${CYAN}サマリー: ✅ ${completed} 完了 | 🔄 ${running} 実行中 | ⏸️ ${rate_limited} 制限 | ❌ ${error} エラー | ⏳ ${pending} 待機${NC}"
+    echo -e "${CYAN}サマリー: ✅ ${completed} 完了 | 🔄 ${running} 実行中 | ⌨️ ${waiting_input} 入力待ち | ⏸️ ${rate_limited} API制限 | 📦 ${context_limited} CTX制限 | ❌ ${error} エラー${NC}"
     echo ""
 }
 
