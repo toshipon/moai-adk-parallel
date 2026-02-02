@@ -66,18 +66,21 @@ get_log_status() {
         return
     fi
 
-    # ログの最後の部分をチェック（ANSIエスケープコードを除去）
-    # script コマンドの出力からANSIコードを除去して検索
-    local last_lines=$(tail -100 "${latest_log}" 2>/dev/null | sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' | tr -d '\r')
+    # 1. 完了判定: May the Force be with you が含まれていれば完了
+    if grep -q "May the Force be with you" "${latest_log}" 2>/dev/null; then
+        echo "success"
+        return
+    fi
 
-    if echo "${last_lines}" | grep -q "May the Force be with you"; then
+    # 2. PR作成完了のマーカーを検索
+    if grep -q "PR 作成完了\|PR作成完了\|pull request.*created" "${latest_log}" 2>/dev/null; then
         echo "success"
-    elif echo "${last_lines}" | grep -q "gh pr create"; then
-        # PR作成コマンドが見つかれば完了に近い
-        echo "success"
-    elif echo "${last_lines}" | grep -q -iE "error:|Error:|ERROR:|failed|Failed|FAILED"; then
-        echo "error"
-    elif [[ -n "${last_lines}" ]]; then
+        return
+    fi
+
+    # 3. 完了マーカーがない場合は、まだ実行中とみなす
+    # （ビルドエラーやMCPエラーは一時的な問題の可能性があり、セッションは継続中）
+    if [[ -s "${latest_log}" ]]; then
         echo "running"
     else
         echo "pending"
