@@ -71,17 +71,34 @@ get_log_status() {
     # 直近の部分（エラー回復判定用）
     local very_last_part=$(tail -20 "${latest_log}" 2>/dev/null)
 
-    # 1. tmux ペインの状態を最初に確認（実行中かどうか）
+    # 1. 実行状態の判定（複数の方法を組み合わせ）
     local window_name="${spec_name}"
-    local pane_content=$(tmux capture-pane -t "${TMUX_SESSION}:${window_name}" -p 2>/dev/null | tail -10)
     local claude_running=false
 
-    # Claude が実行中かどうかを判定（より厳密に）
-    # pane_content に claude/Claude があり、シェルプロンプトで終わっていない場合は実行中
-    if echo "${pane_content}" | grep -qi "claude\|✻\|⎿\|Brewed\|thinking"; then
-        # 最後の行がシェルプロンプトでなければ実行中
-        local last_line=$(echo "${pane_content}" | tail -1)
-        if ! echo "${last_line}" | grep -qE "^[~\$%➜❯]"; then
+    # 方法1: ログファイルの更新時刻をチェック（30秒以内に更新されていれば実行中）
+    local log_mtime=$(stat -f %m "${latest_log}" 2>/dev/null)
+    local current_time=$(date +%s)
+    local time_diff=$((current_time - log_mtime))
+    if [[ ${time_diff} -lt 30 ]]; then
+        claude_running=true
+    fi
+
+    # 方法2: tmux ペインの状態を確認（script コマンド使用時は空になる可能性あり）
+    local pane_content=$(tmux capture-pane -t "${TMUX_SESSION}:${window_name}" -p 2>/dev/null | tail -10)
+    if [[ -n "${pane_content}" ]]; then
+        # pane_content が取得できた場合は従来の判定
+        if echo "${pane_content}" | grep -qi "claude\|✻\|⎿\|Brewed\|thinking\|Whatchamacall"; then
+            local last_line=$(echo "${pane_content}" | tail -1)
+            if ! echo "${last_line}" | grep -qE "^[~\$%➜❯]"; then
+                claude_running=true
+            fi
+        fi
+    fi
+
+    # 方法3: ログファイルの最後の内容から判定
+    if echo "${last_part}" | grep -qiE "Whatchamacall|thinking|✻.*Worked|✻.*Brewed|⎿"; then
+        # 最後に完了マーカーがなければ実行中
+        if ! echo "${last_part}" | grep -qE "May the Force be with you|github\.com/.*/pull/[0-9]+"; then
             claude_running=true
         fi
     fi
@@ -92,15 +109,19 @@ get_log_status() {
         return
     fi
 
-    # 3. Claude が実行中なら、過去のエラーは無視して running を返す
-    if [[ "${claude_running}" == true ]]; then
-        echo "running"
-        return
+    # 3. PR 作成成功を検出（最優先 - 完了状態を正確に判定）
+    # "May the Force be with you" は完了マーカー
+    if grep -qE "github\.com/.*/pull/[0-9]+|Created pull request|PR #[0-9]+ created|✅.*PR.*完了|May the Force be with you" "${latest_log}" 2>/dev/null; then
+        # PR 作成があり、かつログに完了マーカーがある場合は success
+        if grep -qE "github\.com/.*/pull/[0-9]+|Created pull request|PR #[0-9]+ created|✅.*PR" "${latest_log}" 2>/dev/null; then
+            echo "success"
+            return
+        fi
     fi
 
-    # 4. PR 作成成功を検出（汎用的な完了判定）
-    if grep -qE "github\.com/.*/pull/[0-9]+|Created pull request|PR #[0-9]+ created|✅.*PR.*完了" "${latest_log}" 2>/dev/null; then
-        echo "success"
+    # 4. Claude が実行中なら、過去のエラーは無視して running を返す
+    if [[ "${claude_running}" == true ]]; then
+        echo "running"
         return
     fi
 
@@ -205,12 +226,19 @@ show_status() {
         if [[ ! -f "${log_file}" ]]; then
             continue
         fi
-        local name=$(basename "${log_file}" | sed 's/-[0-9].*\.log$//')
+        local name=$(basename "${log_file}" | sed 's/-[0-9]\{8\}-[0-9]\{6\}\.log$//')
         # 配列に含まれていなければ追加
-        if [[ ! " ${unique_specs[*]} " =~ " ${name} " ]]; then
+        if [[ ${#unique_specs[@]} -eq 0 ]] || [[ ! " ${unique_specs[*]} " =~ " ${name} " ]]; then
             unique_specs+=("${name}")
         fi
     done
+
+    # 空の場合は終了
+    if [[ ${#unique_specs[@]} -eq 0 ]]; then
+        echo -e "${GREEN}│${NC} ログファイルがありません"
+        echo -e "${GREEN}└─────────────────────────────────────────────────────────────────┘${NC}"
+        return
+    fi
 
     # ユニークな SPEC 名ごとに処理
     for spec_name in "${unique_specs[@]}"; do
@@ -296,6 +324,114 @@ show_summary() {
     echo ""
 }
 
+cleanup_logs() {
+    local mode="${1:-interactive}"
+    local archive_dir="${LOG_DIR}/archive"
+
+    echo ""
+    echo -e "${CYAN}============================================================================${NC}"
+    echo -e "${CYAN}  MoAI Log Cleanup${NC}"
+    echo -e "${CYAN}============================================================================${NC}"
+    echo ""
+
+    # 完了済み SPEC のログを収集
+    local cleanup_targets=()
+    local unique_specs=()
+
+    for log_file in "${LOG_DIR}"/SPEC-*.log; do
+        if [[ ! -f "${log_file}" ]]; then
+            continue
+        fi
+        local name=$(basename "${log_file}" | sed 's/-[0-9]\{8\}-[0-9]\{6\}\.log$//')
+        if [[ ${#unique_specs[@]} -eq 0 ]] || [[ ! " ${unique_specs[*]} " =~ " ${name} " ]]; then
+            unique_specs+=("${name}")
+        fi
+    done
+
+    if [[ ${#unique_specs[@]} -eq 0 ]]; then
+        echo -e "${GREEN}✓ クリーンナップ対象のログはありません${NC}"
+        echo ""
+        return 0
+    fi
+
+    for spec_name in "${unique_specs[@]}"; do
+        local log_status=$(get_log_status "${spec_name}")
+        if [[ "${log_status}" == "success" ]]; then
+            # この SPEC の全ログファイルを収集
+            while IFS= read -r log_file; do
+                cleanup_targets+=("${log_file}")
+            done < <(ls -t "${LOG_DIR}/${spec_name}-"*.log 2>/dev/null)
+        fi
+    done
+
+    if [[ ${#cleanup_targets[@]} -eq 0 ]]; then
+        echo -e "${GREEN}✓ クリーンナップ対象のログはありません${NC}"
+        echo ""
+        return 0
+    fi
+
+    echo -e "${YELLOW}完了済み SPEC のログファイル (${#cleanup_targets[@]} 件):${NC}"
+    echo ""
+
+    local total_size=0
+    for log_file in "${cleanup_targets[@]}"; do
+        local size=$(du -h "${log_file}" 2>/dev/null | cut -f1)
+        local bytes=$(du -k "${log_file}" 2>/dev/null | cut -f1)
+        total_size=$((total_size + bytes))
+        echo "  📄 $(basename "${log_file}") (${size})"
+    done
+
+    local total_size_h=$(echo "${total_size}" | awk '{printf "%.1fM", $1/1024}')
+    echo ""
+    echo -e "${CYAN}合計サイズ: ${total_size_h}${NC}"
+    echo ""
+
+    if [[ "${mode}" == "force" ]]; then
+        # 強制アーカイブモード
+        mkdir -p "${archive_dir}"
+        for log_file in "${cleanup_targets[@]}"; do
+            mv "${log_file}" "${archive_dir}/"
+        done
+        echo -e "${GREEN}✓ ${#cleanup_targets[@]} 件のログを archive/ に移動しました${NC}"
+    else
+        # インタラクティブモード
+        echo -e "${YELLOW}オプション:${NC}"
+        echo "  1) archive/ に移動 (推奨)"
+        echo "  2) 完全に削除"
+        echo "  3) キャンセル"
+        echo ""
+        read -p "選択 [1-3]: " choice
+
+        case "${choice}" in
+            1)
+                mkdir -p "${archive_dir}"
+                for log_file in "${cleanup_targets[@]}"; do
+                    mv "${log_file}" "${archive_dir}/"
+                done
+                echo ""
+                echo -e "${GREEN}✓ ${#cleanup_targets[@]} 件のログを archive/ に移動しました${NC}"
+                echo -e "${GRAY}場所: ${archive_dir}${NC}"
+                ;;
+            2)
+                read -p "本当に削除しますか？ [y/N]: " confirm
+                if [[ "${confirm}" =~ ^[Yy]$ ]]; then
+                    for log_file in "${cleanup_targets[@]}"; do
+                        rm -f "${log_file}"
+                    done
+                    echo ""
+                    echo -e "${GREEN}✓ ${#cleanup_targets[@]} 件のログを削除しました${NC}"
+                else
+                    echo "キャンセルしました"
+                fi
+                ;;
+            *)
+                echo "キャンセルしました"
+                ;;
+        esac
+    fi
+    echo ""
+}
+
 watch_mode() {
     while true; do
         show_status
@@ -314,12 +450,15 @@ Options:
   -w, --watch            リアルタイム監視モード (5秒ごと更新)
   -l, --logs             最新ログファイル一覧
   -s, --summary          完了サマリーのみ表示
+  -c, --cleanup          完了済みログをクリーンナップ (インタラクティブ)
+  --cleanup-force        完了済みログを archive/ に自動移動
   -h, --help             このヘルプを表示
 
 Examples:
   $0                     # 現在のステータス表示
   $0 --watch             # リアルタイム監視
   $0 --logs              # ログファイル一覧
+  $0 --cleanup           # 完了済みログを整理
 
 tmux 操作:
   tmux attach -t moai-parallel       # セッションにアタッチ
@@ -344,6 +483,12 @@ main() {
             ;;
         -s|--summary)
             show_summary
+            ;;
+        -c|--cleanup)
+            cleanup_logs interactive
+            ;;
+        --cleanup-force)
+            cleanup_logs force
             ;;
         -h|--help)
             show_help
