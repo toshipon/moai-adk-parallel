@@ -40,7 +40,7 @@ LOG_DIR="${PROJECT_ROOT}/.moai/logs/parallel"
 TMUX_SESSION="moai-parallel"
 
 # Default settings
-TARGET_STATUS="draft"
+TARGET_STATUS="draft,in-progress"  # カンマ区切りで複数指定可能
 MAX_PARALLEL=4
 DRY_RUN=false
 LIST_ONLY=false
@@ -89,8 +89,8 @@ MoAI Parallel SPEC Executor - 複数 SPEC の並列実行オーケストレー�
 Usage: $0 [options]
 
 Options:
-  -s, --status STATUS    対象 SPEC のステータス (default: draft)
-                         使用可能: draft, in_progress, review
+  -s, --status STATUS    対象 SPEC のステータス (default: draft,in-progress)
+                         カンマ区切りで複数指定可能: draft,in-progress,review
   -n, --max-parallel N   最大並列数 (default: 4)
   -d, --dry-run          実行せずにプレビューのみ
   -l, --list             対象 SPEC の一覧表示のみ
@@ -98,9 +98,10 @@ Options:
   -h, --help             このヘルプを表示
 
 Examples:
-  $0 --list                           # 着手可能 SPEC を確認
+  $0 --list                           # 着手可能 SPEC を確認 (draft + in-progress)
   $0 --dry-run                        # 実行計画をプレビュー
-  $0                                  # draft ステータスの SPEC を実行
+  $0                                  # draft + in-progress の SPEC を実行
+  $0 --status draft                   # draft のみ実行
   $0 --status in_progress -n 3        # 進行中を3並列で実行
   $0 --no-sync                        # main 同期なしで実行
 
@@ -167,7 +168,7 @@ sync_worktree_with_main() {
 # ============================================================================
 
 find_specs_by_status() {
-    local target_status="$1"
+    local target_statuses="$1"  # カンマ区切りで複数指定可能
     local specs=()
 
     if [[ ! -d "${SPECS_DIR}" ]]; then
@@ -175,17 +176,34 @@ find_specs_by_status() {
         return 1
     fi
 
+    # ターゲットステータスを配列に変換（正規化済み）
+    local -a normalized_targets=()
+    IFS=',' read -ra status_array <<< "${target_statuses}"
+    for ts in "${status_array[@]}"; do
+        normalized_targets+=("$(echo "${ts}" | tr '_' '-')")
+    done
+
     while IFS= read -r spec_file; do
         local spec_dir=$(dirname "${spec_file}")
         local spec_name=$(basename "${spec_dir}")
         local status=$(grep -E "^status:" "${spec_file}" 2>/dev/null | sed 's/status:[[:space:]]*//' | tr -d '[:space:]')
+        # ステータスを正規化
+        local normalized_status
+        normalized_status=$(echo "${status}" | tr '_' '-')
 
-        if [[ "${status}" == "${target_status}" ]]; then
-            specs+=("${spec_name}")
-        fi
+        # ターゲットステータスのいずれかにマッチするかチェック
+        for target in "${normalized_targets[@]}"; do
+            if [[ "${normalized_status}" == "${target}" ]]; then
+                specs+=("${spec_name}")
+                break
+            fi
+        done
     done < <(find "${SPECS_DIR}" -name "spec.md" -type f 2>/dev/null)
 
-    printf '%s\n' "${specs[@]}"
+    # 配列が空でない場合のみ出力
+    if [[ ${#specs[@]} -gt 0 ]]; then
+        printf '%s\n' "${specs[@]}"
+    fi
 }
 
 list_specs() {
