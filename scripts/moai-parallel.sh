@@ -167,6 +167,36 @@ sync_worktree_with_main() {
 # SPEC Detection
 # ============================================================================
 
+# Check if a PR for the given SPEC has been merged
+is_pr_merged() {
+    local spec_name="$1"
+    local branch_name="feature/${spec_name}"
+
+    # Check if there's a merged PR with this branch
+    local merged_pr
+    merged_pr=$(gh pr list --state merged --head "${branch_name}" --json number --jq '.[0].number' 2>/dev/null || echo "")
+
+    if [[ -n "${merged_pr}" ]]; then
+        return 0  # PR is merged
+    fi
+    return 1  # No merged PR found
+}
+
+# Auto-fix SPEC status if PR is merged but status is not completed
+auto_fix_spec_status() {
+    local spec_file="$1"
+    local spec_name="$2"
+
+    if is_pr_merged "${spec_name}"; then
+        log_warn "🔄 ${spec_name}: PR はマージ済みですがステータスが未更新です。自動修正します..."
+        sed -i '' 's/^status:.*/status: completed/' "${spec_file}" 2>/dev/null || \
+        sed -i 's/^status:.*/status: completed/' "${spec_file}" 2>/dev/null
+        log_success "${spec_name}: ステータスを 'completed' に更新しました"
+        return 0  # Was fixed (should be excluded)
+    fi
+    return 1  # Not merged, proceed normally
+}
+
 find_specs_by_status() {
     local target_statuses="$1"  # カンマ区切りで複数指定可能
     local specs=()
@@ -194,6 +224,11 @@ find_specs_by_status() {
         # ターゲットステータスのいずれかにマッチするかチェック
         for target in "${normalized_targets[@]}"; do
             if [[ "${normalized_status}" == "${target}" ]]; then
+                # PRがマージ済みの場合はスキップ（ステータスを自動修正）
+                if auto_fix_spec_status "${spec_file}" "${spec_name}"; then
+                    log_info "⏭️ ${spec_name}: マージ済みのためスキップ"
+                    continue 2  # Skip this spec entirely
+                fi
                 specs+=("${spec_name}")
                 break
             fi
